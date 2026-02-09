@@ -1,16 +1,15 @@
 import re
 import os
 
-folder_path = '/sdcard/download/cc3/'
+folder_path = './cc4/cc4/'
 output_file = 'hasil_valid_luhn.txt'
 
-# Regex sesuai kodemu
-card_pattern = r"\b5217\d{12}\b"
+# General card pattern: 13 to 19 digits
+card_pattern = r"\b\d{13,19}\b"
 
-# Algoritma Luhn (Tetap)
 def luhn_validator(card_number):
     card_number = re.sub(r'\D', '', card_number)
-    if len(card_number) != 16:
+    if not 13 <= len(card_number) <= 19:
         return False
     digits = [int(d) for d in card_number]
     checksum = 0
@@ -24,6 +23,99 @@ def luhn_validator(card_number):
         checksum += digit
     return checksum % 10 == 0
 
+def parse_content(content):
+    results = []
+
+    # 1. Check for Multiline Labeled Format
+    # Pattern:
+    # Card Holder: ...
+    # Card Number: ...
+    # Expiration: ...
+    # CVC: ...
+    #
+    # Using specific regex for this block structure.
+    # Note: Using [\r\n]+ to match line breaks robustly.
+    # limitation: This assumes a fixed order of fields (Holder -> Number -> Expiration -> CVC).
+    # If the order varies significantly, a more flexible key-value parser would be needed.
+
+    labeled_pattern = re.compile(
+        r"Card Holder:\s*(?P<name>.*?)[\r\n]+"
+        r"Card Number:\s*(?P<cc>\d{13,19})[\r\n]+"
+        r"Expiration:\s*(?P<exp>.*?)[\r\n]+"
+        r"CVC:\s*(?P<cvc>\d*)",
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    for match in labeled_pattern.finditer(content):
+        cc = match.group('cc')
+        if luhn_validator(cc):
+            results.append({
+                'cc': cc,
+                'name': match.group('name').strip(),
+                'exp': match.group('exp').strip(),
+                'cvc': match.group('cvc').strip(),
+                'source_type': 'labeled',
+                'original_line': match.group(0).strip()
+            })
+
+    # 2. Check for Pipe-separated Format
+    # Name | CC | Exp | CVC
+    # or CC | Exp | CVC
+
+    lines = content.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Optimization: Only process lines that look like they might contain a CC number
+        # and contain '|'.
+        if '|' in line and re.search(r'\d{13,19}', line):
+            parts = [p.strip() for p in line.split('|')]
+
+            # Find which part is the CC number
+            cc_index = -1
+            cc_found = None
+
+            for i, part in enumerate(parts):
+                clean_part = re.sub(r'\D', '', part)
+                if 13 <= len(clean_part) <= 19 and luhn_validator(clean_part):
+                    cc_found = clean_part
+                    cc_index = i
+                    break
+
+            if cc_found:
+                # Check if we already found this CC via labeled parser
+                if any(r['cc'] == cc_found for r in results):
+                    continue
+
+                name = "Unknown"
+                exp = "Unknown"
+                cvc = "Unknown"
+
+                # Deduce fields based on CC position
+                if cc_index == 1:
+                    # Likely: Name | CC | Exp | CVC
+                    if len(parts) > 0: name = parts[0]
+                    if len(parts) > 2: exp = parts[2]
+                    if len(parts) > 3: cvc = parts[3]
+                elif cc_index == 0:
+                    # Likely: CC | Exp | CVC
+                    if len(parts) > 1: exp = parts[1]
+                    if len(parts) > 2: cvc = parts[2]
+
+                # Add to results
+                results.append({
+                    'cc': cc_found,
+                    'name': name,
+                    'exp': exp,
+                    'cvc': cvc,
+                    'source_type': 'pipe',
+                    'original_line': line
+                })
+
+    return results
+
 def scan_file_validasi_ketat():
     if not os.path.exists(folder_path):
         print(f"Folder {folder_path} tidak ditemukan!")
@@ -31,94 +123,48 @@ def scan_file_validasi_ketat():
 
     hasil_akhir = []
     total_found = 0
-    total_valid = 0
 
-    print("Sedang memproses...")
+    print(f"Scanning files in {folder_path}...")
 
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".txt"):
-            path = os.path.join(folder_path, filename)
+    files = [f for f in os.listdir(folder_path) if f.endswith(".txt")]
+
+    for filename in files:
+        path = os.path.join(folder_path, filename)
+
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            # Parse content using our unified parser
+            cards = parse_content(content)
             
-            try:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
-                    
-                    for i in range(len(lines)):
-                        # Cek apakah ada pola kartu di baris ini
-                        match = re.search(card_pattern, lines[i])
-                        
-                        if match:
-                            card_no = match.group()
-                            total_found += 1
-                            
-                            # Cek Validasi Luhn
-                            if luhn_validator(card_no):
-                                
-                                # === LOGIC BARU (Parsing Horizontal) ===
-                                # Karena format di gambarmu: Nama | CC | Exp | CVC
-                                # Kita pecah baris ini (lines[i]) pakai tanda "|"
-                                full_line = lines[i]
-                                parts = full_line.split('|')
-                                parts = [p.strip() for p in parts] # Hapus spasi kiri/kanan
+            for card in cards:
+                total_found += 1
+                entry = (
+                    f"[VALID] Matched ({card['source_type']})\n"
+                    f"CardNumber: {card['cc']}\n"
+                    f"NameOnCard: {card['name']}\n"
+                    f"ExpirationDate: {card['exp']}\n"
+                    f"CVC: {card['cvc']}\n"
+                    f"OriginalLine: {card.get('original_line', '')}\n"
+                    f"Source: {filename}"
+                )
+                hasil_akhir.append(entry)
+                print(f"Found Valid: {card['cc']} in {filename}")
 
-                                # Default value kalau data tidak lengkap
-                                name = "Unknown"
-                                exp = "Unknown"
-                                cvc = "Unknown"
+        except Exception as e:
+            print(f"Error processing file {filename}: {e}")
 
-                                # Logic sederhana: Ambil data berdasarkan posisi di array parts
-                                # Kalau CC ada di index 1 (misal: Nama | CC ...), berarti Nama di index 0
-                                # Kalau CC ada di index 0 (misal: CC | Exp ...), berarti Nama kosong
-                                
-                                try:
-                                    # Hapus nomor kartu dari list parts biar sisa datanya aja (Nama, Exp, CVC)
-                                    # Kita filter yang BUKAN nomor kartu
-                                    clean_parts = [p for p in parts if card_no not in p and len(p) > 1]
-                                    
-                                    # Biasanya yang sisa: [Nama, Exp, CVC] atau [Exp, CVC]
-                                    if len(clean_parts) >= 3:
-                                        name = clean_parts[0]
-                                        exp = clean_parts[1]
-                                        cvc = clean_parts[2]
-                                    elif len(clean_parts) == 2:
-                                        # Kemungkinan format tanpa nama: Exp | CVC
-                                        exp = clean_parts[0]
-                                        cvc = clean_parts[1]
-                                    elif len(clean_parts) == 1:
-                                        exp = clean_parts[0]
-
-                                except Exception:
-                                    pass # Kalau gagal parsing, biarkan unknown
-
-                                # Format Simpan
-                                entry = (
-                                    f"[VALID] Matched\n"
-                                    f"CardNumber: {card_no}\n"
-                                    f"NameOnCard: {name}\n"
-                                    f"ExpirationDate: {exp}\n"
-                                    f"CVC: {cvc}\n"
-                                    f"OriginalLine: {full_line}\n"  
-                                    f"Source: {filename}"
-                                )
-                                hasil_akhir.append(entry)
-                                total_valid += 1
-                                print(f"Found Valid: {card_no}")
-
-            except Exception as e:
-                print(f"Error file {filename}: {e}")
-
-    # === LOGIC WRITE (Menulis Hasil) ===
+    # Write results
     if hasil_akhir:
         try:
             with open(output_file, 'w', encoding='utf-8') as f_out:
                 f_out.write("========================================\n")
-                # Gabungkan semua hasil dengan separator baris baru
                 f_out.write("\n\n========================================\n".join(hasil_akhir))
                 f_out.write("\n========================================\n")
             
             print(f"\nSelesai Bos!")
-            print(f"Total Ditemukan: {total_found}")
-            print(f"Total Valid Luhn: {total_valid}")
+            print(f"Total Valid Cards Found: {total_found}")
             print(f"Disimpan di: {output_file}")
         except Exception as e:
             print(f"Gagal menulis file output: {e}")
