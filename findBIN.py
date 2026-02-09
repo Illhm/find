@@ -2,15 +2,16 @@ import re
 import os
 
 folder_path = '/sdcard/download/cc3/'
-output_file = 'hasil_valid_luhn.txt'
+output_file_all = 'all.txt'
+output_file_5217 = 'find_5217.txt'
 
-# Regex sesuai kodemu
-card_pattern = r"\b5217\d{12}\b"
+# Regex lebih umum (13-19 digit)
+card_pattern = r"\b\d{13,19}\b"
 
-# Algoritma Luhn (Tetap)
 def luhn_validator(card_number):
     card_number = re.sub(r'\D', '', card_number)
-    if len(card_number) != 16:
+    # Validasi panjang kartu umum (13-19 digit)
+    if not (13 <= len(card_number) <= 19):
         return False
     digits = [int(d) for d in card_number]
     checksum = 0
@@ -29,7 +30,8 @@ def scan_file_validasi_ketat():
         print(f"Folder {folder_path} tidak ditemukan!")
         return
 
-    hasil_akhir = []
+    hasil_all = []
+    hasil_5217 = []
     total_found = 0
     total_valid = 0
 
@@ -42,11 +44,11 @@ def scan_file_validasi_ketat():
             try:
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                     lines = [line.strip() for line in f.readlines() if line.strip()]
-                    
+
                     for i in range(len(lines)):
                         # Cek apakah ada pola kartu di baris ini
                         match = re.search(card_pattern, lines[i])
-                        
+
                         if match:
                             card_no = match.group()
                             total_found += 1
@@ -54,41 +56,31 @@ def scan_file_validasi_ketat():
                             # Cek Validasi Luhn
                             if luhn_validator(card_no):
                                 
-                                # === LOGIC BARU (Parsing Horizontal) ===
-                                # Karena format di gambarmu: Nama | CC | Exp | CVC
-                                # Kita pecah baris ini (lines[i]) pakai tanda "|"
+                                # === LOGIC PARSING (Horizontal) ===
                                 full_line = lines[i]
                                 parts = full_line.split('|')
-                                parts = [p.strip() for p in parts] # Hapus spasi kiri/kanan
+                                parts = [p.strip() for p in parts]
 
-                                # Default value kalau data tidak lengkap
+                                # Default value
                                 name = "Unknown"
                                 exp = "Unknown"
                                 cvc = "Unknown"
 
-                                # Logic sederhana: Ambil data berdasarkan posisi di array parts
-                                # Kalau CC ada di index 1 (misal: Nama | CC ...), berarti Nama di index 0
-                                # Kalau CC ada di index 0 (misal: CC | Exp ...), berarti Nama kosong
-                                
                                 try:
-                                    # Hapus nomor kartu dari list parts biar sisa datanya aja (Nama, Exp, CVC)
-                                    # Kita filter yang BUKAN nomor kartu
                                     clean_parts = [p for p in parts if card_no not in p and len(p) > 1]
-                                    
-                                    # Biasanya yang sisa: [Nama, Exp, CVC] atau [Exp, CVC]
+
                                     if len(clean_parts) >= 3:
                                         name = clean_parts[0]
                                         exp = clean_parts[1]
                                         cvc = clean_parts[2]
                                     elif len(clean_parts) == 2:
-                                        # Kemungkinan format tanpa nama: Exp | CVC
                                         exp = clean_parts[0]
                                         cvc = clean_parts[1]
                                     elif len(clean_parts) == 1:
                                         exp = clean_parts[0]
 
                                 except Exception:
-                                    pass # Kalau gagal parsing, biarkan unknown
+                                    pass
 
                                 # Format Simpan
                                 entry = (
@@ -97,33 +89,53 @@ def scan_file_validasi_ketat():
                                     f"NameOnCard: {name}\n"
                                     f"ExpirationDate: {exp}\n"
                                     f"CVC: {cvc}\n"
-                                    f"OriginalLine: {full_line}\n"  
+                                    f"OriginalLine: {full_line}\n"
                                     f"Source: {filename}"
                                 )
-                                hasil_akhir.append(entry)
+
+                                # Simpan ke list ALL
+                                hasil_all.append(entry)
+
+                                # Cek awalan 5217
+                                if card_no.startswith('5217'):
+                                    hasil_5217.append(entry)
+
                                 total_valid += 1
                                 print(f"Found Valid: {card_no}")
 
             except Exception as e:
                 print(f"Error file {filename}: {e}")
 
-    # === LOGIC WRITE (Menulis Hasil) ===
-    if hasil_akhir:
+    # === WRITE ALL ===
+    if hasil_all:
         try:
-            with open(output_file, 'w', encoding='utf-8') as f_out:
+            with open(output_file_all, 'w', encoding='utf-8') as f_out:
                 f_out.write("========================================\n")
-                # Gabungkan semua hasil dengan separator baris baru
-                f_out.write("\n\n========================================\n".join(hasil_akhir))
+                f_out.write("\n\n========================================\n".join(hasil_all))
                 f_out.write("\n========================================\n")
-            
-            print(f"\nSelesai Bos!")
-            print(f"Total Ditemukan: {total_found}")
-            print(f"Total Valid Luhn: {total_valid}")
-            print(f"Disimpan di: {output_file}")
+            print(f"Semua valid disimpan di: {output_file_all}")
         except Exception as e:
-            print(f"Gagal menulis file output: {e}")
+            print(f"Gagal menulis {output_file_all}: {e}")
     else:
-        print("Zonk. Tidak ada kartu valid ditemukan.")
+        print("Tidak ada kartu valid ditemukan.")
+
+    # === WRITE 5217 ===
+    if hasil_5217:
+        try:
+            with open(output_file_5217, 'w', encoding='utf-8') as f_out:
+                f_out.write("========================================\n")
+                f_out.write("\n\n========================================\n".join(hasil_5217))
+                f_out.write("\n========================================\n")
+            print(f"Kartu 5217 disimpan di: {output_file_5217}")
+        except Exception as e:
+            print(f"Gagal menulis {output_file_5217}: {e}")
+    else:
+        print("Tidak ada kartu awalan 5217 ditemukan.")
+
+    print(f"\nSelesai Bos!")
+    print(f"Total Ditemukan (Regex): {total_found}")
+    print(f"Total Valid Luhn: {total_valid}")
+    print(f"Total Valid 5217: {len(hasil_5217)}")
 
 if __name__ == "__main__":
     scan_file_validasi_ketat()
