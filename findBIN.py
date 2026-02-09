@@ -1,16 +1,31 @@
-import re
+import json
 import os
+import re
 
 folder_path = '/sdcard/download/cc3/'
 output_file = 'hasil_valid_luhn.txt'
 
-# Regex sesuai kodemu
-card_pattern = r"\b5217\d{12}\b"
+# Regex patterns
+CARD_NUMBER_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+PIPE_ENTRY_RE = re.compile(
+    r"^\s*(?P<name>[^|]*?)\s*\|\s*(?P<number>\d{13,19})\s*\|\s*"
+    r"(?P<exp>\d{1,2}\s*/\s*\d{2,4})\s*(?:\|\s*(?P<cvc>\d{3,4})\s*)?$"
+)
+LABEL_FIELD_RE = re.compile(
+    r"^\s*(?P<label>Card Holder|Card Number|Expiration|CVC|Type|Number|Exp|Holder)\s*:\s*(?P<value>.*)\s*$",
+    re.IGNORECASE,
+)
+KATZ_FIELD_RE = re.compile(
+    r"^\s*(?P<label>name|month|year|card|cvc2)\s*:\s*(?P<value>.*)\s*$",
+    re.IGNORECASE,
+)
+EXP_RE = re.compile(r"\b(?P<month>\d{1,2})\s*/\s*(?P<year>\d{2,4})\b")
+SEPARATOR_RE = re.compile(r"^\s*=+\s*$")
 
 # Algoritma Luhn (Tetap)
 def luhn_validator(card_number):
     card_number = re.sub(r'\D', '', card_number)
-    if len(card_number) != 16:
+    if len(card_number) < 13 or len(card_number) > 19:
         return False
     digits = [int(d) for d in card_number]
     checksum = 0
@@ -24,88 +39,202 @@ def luhn_validator(card_number):
         checksum += digit
     return checksum % 10 == 0
 
+def normalize_card_number(raw_number):
+    return re.sub(r"\D", "", raw_number or "")
+
+def extract_expiration(text):
+    match = EXP_RE.search(text or "")
+    if not match:
+        return ""
+    month = match.group("month")
+    year = match.group("year")
+    return f"{month}/{year}"
+
+def build_entry(card_no, name, exp, cvc, full_line, filename):
+    entry_key = (
+        card_no,
+        name or "Unknown",
+        exp or "Unknown",
+        cvc or "Unknown",
+        filename,
+        full_line,
+    )
+    entry_text = (
+        f"[VALID] Matched\n"
+        f"CardNumber: {card_no}\n"
+        f"NameOnCard: {name or 'Unknown'}\n"
+        f"ExpirationDate: {exp or 'Unknown'}\n"
+        f"CVC: {cvc or 'Unknown'}\n"
+        f"OriginalLine: {full_line}\n"
+        f"Source: {filename}"
+    )
+    return entry_key, entry_text
+
+def add_entry(results, seen, entry_key, entry_text):
+    if entry_key in seen:
+        return
+    seen.add(entry_key)
+    results.append(entry_text)
+
+def finalize_entry(entry, results, seen, filename, original_line=""):
+    card_no = normalize_card_number(entry.get("number"))
+    if not card_no or not luhn_validator(card_no):
+        return
+    entry_key, entry_text = build_entry(
+        card_no,
+        entry.get("name", "Unknown"),
+        entry.get("exp", "Unknown"),
+        entry.get("cvc", "Unknown"),
+        original_line or entry.get("line", ""),
+        filename,
+    )
+    add_entry(results, seen, entry_key, entry_text)
+
+def parse_pipe_lines(lines, results, seen, filename):
+    for line in lines:
+        match = PIPE_ENTRY_RE.match(line)
+        if not match:
+            continue
+        card_no = match.group("number")
+        if not luhn_validator(card_no):
+            continue
+        entry_key, entry_text = build_entry(
+            card_no,
+            match.group("name").strip() or "Unknown",
+            match.group("exp").replace(" ", ""),
+            (match.group("cvc") or "").strip() or "Unknown",
+            line,
+            filename,
+        )
+        add_entry(results, seen, entry_key, entry_text)
+
+def parse_labeled_blocks(lines, results, seen, filename):
+    label_mapping = {
+        "card holder": "name",
+        "card number": "number",
+        "expiration": "exp",
+        "cvc": "cvc",
+        "number": "number",
+        "exp": "exp",
+        "holder": "name",
+    }
+    current = {}
+    for line in lines:
+        if SEPARATOR_RE.match(line):
+            finalize_entry(current, results, seen, filename)
+            current = {}
+            continue
+        match = LABEL_FIELD_RE.match(line)
+        if not match:
+            continue
+        label = match.group("label").lower()
+        value = match.group("value").strip()
+        key = label_mapping.get(label)
+        if not key:
+            continue
+        if label == "card holder" and current.get("number"):
+            finalize_entry(current, results, seen, filename)
+            current = {}
+        current[key] = value
+        current["line"] = line
+    finalize_entry(current, results, seen, filename)
+
+def parse_katz_blocks(lines, results, seen, filename):
+    current = {}
+    for line in lines:
+        match = KATZ_FIELD_RE.match(line)
+        if not match:
+            continue
+        label = match.group("label").lower()
+        value = match.group("value").strip()
+        if label == "name" and current.get("number"):
+            finalize_entry(current, results, seen, filename)
+            current = {}
+        if label == "card":
+            current["number"] = value
+        elif label == "name":
+            current["name"] = value
+        elif label == "month":
+            current["exp_month"] = value
+        elif label == "year":
+            current["exp_year"] = value
+        elif label == "cvc2":
+            current["cvc"] = value
+        current["line"] = line
+        if current.get("exp_month") and current.get("exp_year"):
+            current["exp"] = f"{current['exp_month']}/{current['exp_year']}"
+    finalize_entry(current, results, seen, filename)
+
+def parse_generic_lines(lines, results, seen, filename):
+    for line in lines:
+        for match in CARD_NUMBER_RE.finditer(line):
+            card_no = normalize_card_number(match.group())
+            if not luhn_validator(card_no):
+                continue
+            exp = extract_expiration(line)
+            cvc_match = re.search(r"\b\d{3,4}\b", line)
+            cvc = cvc_match.group() if cvc_match else ""
+            entry_key, entry_text = build_entry(card_no, "Unknown", exp, cvc, line, filename)
+            add_entry(results, seen, entry_key, entry_text)
+
+def parse_text_file(path, filename, results, seen):
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+    parse_pipe_lines(lines, results, seen, filename)
+    parse_labeled_blocks(lines, results, seen, filename)
+    parse_katz_blocks(lines, results, seen, filename)
+    parse_generic_lines(lines, results, seen, filename)
+
+def parse_json_file(path, filename, results, seen):
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        card_no = normalize_card_number(item.get("Number", ""))
+        if not card_no or not luhn_validator(card_no):
+            continue
+        exp_month = str(item.get("ExpMonth", "")).strip()
+        exp_year = str(item.get("ExpYear", "")).strip()
+        exp = f"{exp_month}/{exp_year}" if exp_month and exp_year else ""
+        entry_key, entry_text = build_entry(
+            card_no,
+            item.get("Name", "Unknown"),
+            exp or "Unknown",
+            item.get("CVC", "Unknown"),
+            json.dumps(item, ensure_ascii=False),
+            filename,
+        )
+        add_entry(results, seen, entry_key, entry_text)
+
 def scan_file_validasi_ketat():
     if not os.path.exists(folder_path):
         print(f"Folder {folder_path} tidak ditemukan!")
         return
 
     hasil_akhir = []
+    seen_entries = set()
     total_found = 0
     total_valid = 0
 
     print("Sedang memproses...")
 
     for filename in os.listdir(folder_path):
-        if filename.endswith(".txt"):
-            path = os.path.join(folder_path, filename)
-            
-            try:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
-                    
-                    for i in range(len(lines)):
-                        # Cek apakah ada pola kartu di baris ini
-                        match = re.search(card_pattern, lines[i])
-                        
-                        if match:
-                            card_no = match.group()
-                            total_found += 1
-                            
-                            # Cek Validasi Luhn
-                            if luhn_validator(card_no):
-                                
-                                # === LOGIC BARU (Parsing Horizontal) ===
-                                # Karena format di gambarmu: Nama | CC | Exp | CVC
-                                # Kita pecah baris ini (lines[i]) pakai tanda "|"
-                                full_line = lines[i]
-                                parts = full_line.split('|')
-                                parts = [p.strip() for p in parts] # Hapus spasi kiri/kanan
+        if not (filename.endswith(".txt") or filename.endswith(".json")):
+            continue
+        path = os.path.join(folder_path, filename)
+        try:
+            if filename.endswith(".json"):
+                parse_json_file(path, filename, hasil_akhir, seen_entries)
+            else:
+                parse_text_file(path, filename, hasil_akhir, seen_entries)
+        except Exception as e:
+            print(f"Error file {filename}: {e}")
 
-                                # Default value kalau data tidak lengkap
-                                name = "Unknown"
-                                exp = "Unknown"
-                                cvc = "Unknown"
-
-                                # Logic sederhana: Ambil data berdasarkan posisi di array parts
-                                # Kalau CC ada di index 1 (misal: Nama | CC ...), berarti Nama di index 0
-                                # Kalau CC ada di index 0 (misal: CC | Exp ...), berarti Nama kosong
-                                
-                                try:
-                                    # Hapus nomor kartu dari list parts biar sisa datanya aja (Nama, Exp, CVC)
-                                    # Kita filter yang BUKAN nomor kartu
-                                    clean_parts = [p for p in parts if card_no not in p and len(p) > 1]
-                                    
-                                    # Biasanya yang sisa: [Nama, Exp, CVC] atau [Exp, CVC]
-                                    if len(clean_parts) >= 3:
-                                        name = clean_parts[0]
-                                        exp = clean_parts[1]
-                                        cvc = clean_parts[2]
-                                    elif len(clean_parts) == 2:
-                                        # Kemungkinan format tanpa nama: Exp | CVC
-                                        exp = clean_parts[0]
-                                        cvc = clean_parts[1]
-                                    elif len(clean_parts) == 1:
-                                        exp = clean_parts[0]
-
-                                except Exception:
-                                    pass # Kalau gagal parsing, biarkan unknown
-
-                                # Format Simpan
-                                entry = (
-                                    f"[VALID] Matched\n"
-                                    f"CardNumber: {card_no}\n"
-                                    f"NameOnCard: {name}\n"
-                                    f"ExpirationDate: {exp}\n"
-                                    f"CVC: {cvc}\n"
-                                    f"OriginalLine: {full_line}\n"  
-                                    f"Source: {filename}"
-                                )
-                                hasil_akhir.append(entry)
-                                total_valid += 1
-                                print(f"Found Valid: {card_no}")
-
-            except Exception as e:
-                print(f"Error file {filename}: {e}")
+    total_valid = len(hasil_akhir)
+    total_found = total_valid
 
     # === LOGIC WRITE (Menulis Hasil) ===
     if hasil_akhir:
